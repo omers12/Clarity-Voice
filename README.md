@@ -24,9 +24,24 @@ Final project for B.SC Software Engineering Degree
 ---
 
 ## 🔧 התקנה והרצה
+בדפדפן : בקישור המצורף 
 
+לוקלית על המחשב : 
 ```bash
 git clone https://github.com/your-username/microphone-app.git
 cd microphone-app
 npm install        # או pip install -r requirements.txt
 npm start          # או python main.py
+
+src/
+├── index.html      – ממשק המשתמש (ל‑web)
+├── app.js          – לוגיקת האפליקציה
+├── recorder.js     – התחברות למיקרופון
+└── whisper.js      – אינטגרציה למודל זיהוי דיבור
+
+#📬 צור קשר
+omershay1212@gmail.com
+GitHub: https://github.com/omers12
+Phone- +972-509355151
+
+
