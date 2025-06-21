@@ -10,7 +10,9 @@
         "web": "expo start --web",
         "test": "jest --watchAll",
         "lint": "expo lint",
-        "server": "ts-node server/server.ts"
+        "server": "ts-node server/server.ts",
+        "build": "expo export --platform web"
+
     },
     "jest": {
         "preset": "jest-expo"

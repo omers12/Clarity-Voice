@@ -6,16 +6,55 @@ import * as speechsdk from 'microsoft-cognitiveservices-speech-sdk';
 import { SPEECH_KEY, SPEECH_REGION } from '@/env';
 import { voiceAnalyticsStyles as styles } from '@/constants/StyleFroPage';
 import { useAuth } from '@/hooks/useAuth';
-import { connectDB, disconnectDB } from '@/lib/db/mongodb';
-import Transcription from '@/lib/db/models/Transcription';
-import { IconSymbol } from './ui/IconSymbol';
-import { COLORS, API_URL } from '@/constants/voiceAnalyticsConstants';
-import { calculateAudioLevel, calculateMovingAverage, calculateBaseline, getVolumeColor, getSpeakerDisplayName, getBackgroundIconName } from '@/lib/voiceAnalyticsHelpers';
-import AudioLevelIndicator from './voiceAnalytics/AudioLevelIndicator';
-import SoundLevelLegend from './voiceAnalytics/SoundLevelLegend';
-import type { Transcript, VolumeNotification } from '@/types/voiceAnalytics';
-import Sidebar from './voiceAnalytics/Sidebar';
-import MaterialIcons from '@expo/vector-icons/MaterialIcons';
+import { VoiceProfileSetup } from '@/components/VoiceProfileSetup';
+
+// Sound level thresholds configuration
+const SOUND_LEVELS = {
+    QUIET: {
+        MIN: 0,
+        MAX: 40,
+        COLOR: '#22c55e', // Green
+        LABEL: 'Quiet'
+    },
+    MODERATE: {
+        MIN: 40,
+        MAX: 60,
+        COLOR: '#f97316', // Orange
+        LABEL: 'Moderate'
+    },
+    LOUD: {
+        MIN: 60,
+        MAX: Infinity,
+        COLOR: '#ef4444', // Red
+        LABEL: 'Loud'
+    }
+} as const;
+
+// Color constants
+const COLORS = {
+    // Audio level colors
+    AUDIO: {
+        QUIET: SOUND_LEVELS.QUIET.COLOR,
+        MODERATE: SOUND_LEVELS.MODERATE.COLOR,
+        LOUD: SOUND_LEVELS.LOUD.COLOR,
+    },
+    // Speaker status colors
+    SPEAKER: {
+        ACTIVE: '#22c55e',   // Green - active speaker
+        INACTIVE: '#94a3b8', // Gray - inactive speaker
+        OTHER: '#ef4444',    // Red - other speakers
+    },
+    // UI elements
+    UI: {
+        BACKGROUND: '#ffffff',
+        TEXT: '#000000',
+        BORDER: '#e5e7eb',
+    }
+} as const;
+
+// Add this constant at the top of the file
+const API_URL = 'https://microphone-server-2617c5e1bee8.herokuapp.com/api';
+const SAMPLING_TIMEOUT_MS = 5000; // Adjust this value as needed
 
 export const VoiceAnalytics: React.FC = () => {
     const { width } = useWindowDimensions();
@@ -50,21 +89,24 @@ export const VoiceAnalytics: React.FC = () => {
 
     // Add new state for save status
     const [saveStatus, setSaveStatus] = useState<{ type: 'success' | 'error', message: string } | null>(null);
-    const [transcriptionHistory, setTranscriptionHistory] = useState<Transcript[]>([]);
+    const [transcriptionHistory, setTranscriptionHistory] = useState<Array<{
+        _id: string;
+        text: string;
+        timestamp: Date;
+        speakerId: string;
+        conversationId: string;
+    }>>([]);
     const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
 
     const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-    const sidebarAnim = useRef(new Animated.Value(-320)).current;
+    const sidebarAnim = useRef(new Animated.Value(-300)).current;
 
     const [isRecording, setIsRecording] = useState(false);
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
     const chunksRef = useRef<Blob[]>([]);
 
-    const [volumeNotification, setVolumeNotification] = useState<{ message: string, type: 'high' | 'low' | 'ok' | 'background', color?: string } | null>(null);
+    const [volumeNotification, setVolumeNotification] = useState<{ message: string, type: 'high' | 'low' } | null>(null);
     const notificationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-    const lastNotificationRef = useRef<string | null>(null);
-
-    const speakerLevelTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
     // Add useEffect to clear transcripts on mount
     useEffect(() => {
@@ -94,6 +136,65 @@ export const VoiceAnalytics: React.FC = () => {
             pulseAnim.setValue(1);
         }
     }, [currentSpeaker, pulseAnim]);
+
+    const calculateAudioLevel = (dataArray: Uint8Array): number => {
+        // Calculate RMS (Root Mean Square) of the audio data
+        const rms = Math.sqrt(
+            dataArray.reduce((sum, val) => sum + (val * val), 0) / dataArray.length
+        );
+
+        // Convert to dB, using a reference level
+        // Adding 1 to avoid Math.log(0)
+        const db = 20 * Math.log10((rms + 1) / 255);
+
+        // Normalize dB value to a reasonable range (-60dB to 0dB)
+        const normalizedDb = Math.max(-60, Math.min(0, db));
+
+        // Convert to positive range (0-60)
+        return Math.round(normalizedDb + 60);
+    };
+
+    const calculateMovingAverage = (values: number[], windowSize: number = 10): number => {
+        if (values.length === 0) return 0;
+        const window = values.slice(-windowSize);
+        return Math.round(window.reduce((a, b) => a + b, 0) / window.length);
+    };
+
+    const calculateBaseline = () => {
+        const windowSize = 30; // Use last 0.5 seconds of data (assuming 60fps)
+        if (recentNoiseLevelsRef.current.length > 0) {
+            const newBaseline = calculateMovingAverage(recentNoiseLevelsRef.current, windowSize);
+
+            // Only update baseline if it's a meaningful value (above 5) or actually 0
+            if (newBaseline === 0 || newBaseline > 5) {
+                baselineNoiseRef.current = newBaseline;
+                setBackgroundLevel(newBaseline); // Update the background level state
+                console.log('New baseline established:', newBaseline);
+            }
+        }
+    };
+
+    const cleanupAudioResources = () => {
+        if (sourceRef.current) {
+            sourceRef.current.disconnect();
+            sourceRef.current = null;
+        }
+        if (analyserRef.current) {
+            analyserRef.current = null;
+        }
+        if (audioContextRef.current) {
+            audioContextRef.current.close();
+            audioContextRef.current = null;
+        }
+    };
+
+    const cleanupTranscriber = () => {
+        if (cleanupRef.current) {
+            const transcriber = cleanupRef.current;
+            cleanupRef.current = null;
+            transcriber();
+        }
+    };
 
     const startRecording = async () => {
         try {
@@ -231,17 +332,14 @@ export const VoiceAnalytics: React.FC = () => {
                     }
 
                     const speaker = `Speaker ${speakerId}`;
-                    const displaySpeaker = getSpeakerDisplayName(speaker, userName);
+                    const displaySpeaker = getSpeakerDisplayName(speaker);
 
                     if (!firstSpeakerRef.current) {
                         firstSpeakerRef.current = speaker;
                         setActiveSpeakers([displaySpeaker]);
 
-                        const newBaseline = calculateBaseline(recentNoiseLevelsRef.current);
-                        if (newBaseline === 0 || newBaseline > 5) {
-                            baselineNoiseRef.current = newBaseline;
-                            setBackgroundLevel(newBaseline);
-                            console.log('New baseline established:', newBaseline);
+                        if (speaker === 'Speaker Guest-1') {
+                            calculateBaseline();
                         }
                     }
 
@@ -251,13 +349,6 @@ export const VoiceAnalytics: React.FC = () => {
                         // Get the raw audio level
                         const currentNoise = calculateMovingAverage(recentNoiseLevelsRef.current);
                         setSpeakerLevel(currentNoise);
-                        // Reset speaker level after 5 seconds
-                        if (speakerLevelTimeoutRef.current) {
-                            clearTimeout(speakerLevelTimeoutRef.current);
-                        }
-                        speakerLevelTimeoutRef.current = setTimeout(() => {
-                            setSpeakerLevel(0);
-                        }, 5000);
 
                         // Save transcription to server with conversation ID
                         if (!currentConversationId) {
@@ -284,7 +375,7 @@ export const VoiceAnalytics: React.FC = () => {
                             }
 
                             const lineDB = await response.json();
-
+                            
                             // Update local state
                             const newTranscription = {
                                 _id: lineDB._id,
@@ -292,7 +383,6 @@ export const VoiceAnalytics: React.FC = () => {
                                 timestamp: new Date(),
                                 speakerId: speakerId,
                                 conversationId: currentConversationId,
-                                userId: user?.id || '',
                             };
 
                             setTranscriptionHistory(prev => [...prev, newTranscription]);
@@ -315,15 +405,10 @@ export const VoiceAnalytics: React.FC = () => {
 
                         setTimeout(() => {
                             setCurrentSpeaker(null);
-                            const newBaseline = calculateBaseline(recentNoiseLevelsRef.current);
-                            if (newBaseline === 0 || newBaseline > 5) {
-                                baselineNoiseRef.current = newBaseline;
-                                setBackgroundLevel(newBaseline);
-                                console.log('New baseline established:', newBaseline);
-                            }
+                            calculateBaseline();
                             setSpeakerLevel(0);
                             setSaveStatus(null);
-                        }, 8000);
+                        }, SAMPLING_TIMEOUT_MS);
                     }
                 } catch (error) {
                     console.error('Error in transcription handler:', error);
@@ -370,7 +455,7 @@ export const VoiceAnalytics: React.FC = () => {
                 const response = await fetch(`${API_URL}/transcriptions?userId=${user?.id}`);
                 if (!response.ok) throw new Error('Failed to connect to server');
                 const data = await response.json();
-                setTranscriptionHistory(data.map((item: any) => ({ ...item, userId: item.userId || user?.id || '' })));
+                setTranscriptionHistory(data);
                 if (mounted) {
                     setTranscripts(data);
                     setSaveStatus({
@@ -401,7 +486,7 @@ export const VoiceAnalytics: React.FC = () => {
     // Add this after the existing useEffect hooks
     useEffect(() => {
         Animated.timing(sidebarAnim, {
-            toValue: isSidebarOpen ? 0 : -320,
+            toValue: isSidebarOpen ? 0 : -300,
             duration: 300,
             useNativeDriver: true,
         }).start();
@@ -409,47 +494,120 @@ export const VoiceAnalytics: React.FC = () => {
 
     // Add useEffect for volume notifications
     useEffect(() => {
-        // Only show notification if the speaker level is significantly above the background (actual voice)
-        const threshold = 8; // dB above background to consider as speaking
-        const isSpeaking = speakerLevel - backgroundLevel > threshold;
-
-        let notification: { message: string, type: 'high' | 'low' | 'ok' | 'background', color?: string } | null = null;
-        if (isSpeaking) {
-            if (speakerLevel > 40) {
-                notification = { message: "Keep the volume down", type: 'high', color: COLORS.AUDIO.LOUD };
-            } else if (speakerLevel < backgroundLevel + threshold + 5) {
-                notification = { message: "Please speak louder", type: 'low', color: COLORS.AUDIO.MODERATE };
-            } else {
-                notification = { message: "Good speaking volume", type: 'ok', color: COLORS.AUDIO.QUIET };
-            }
+        // Clear any existing notification timeout
+        if (notificationTimeoutRef.current) {
+            clearTimeout(notificationTimeoutRef.current);
         }
-
-        // Only set a new notification if it is different from the last one
-        if (notification && notification.message !== lastNotificationRef.current) {
-            setVolumeNotification(notification);
-            lastNotificationRef.current = notification.message;
-            if (notificationTimeoutRef.current) {
-                clearTimeout(notificationTimeoutRef.current);
-            }
+        
+        // Set new notification based on volume level
+        if (speakerLevel >= SOUND_LEVELS.LOUD.MIN) {
+            setVolumeNotification({ message: "Keep the volume down", type: 'high' });
             notificationTimeoutRef.current = setTimeout(() => {
                 setVolumeNotification(null);
-                lastNotificationRef.current = null;
-            }, 8000); // Show notification for 8 seconds
+            }, 3000);
+        } else if (speakerLevel < SOUND_LEVELS.MODERATE.MIN / 2) { // If below half of moderate threshold
+            setVolumeNotification({ message: "Please speak louder", type: 'low' });
+            notificationTimeoutRef.current = setTimeout(() => {
+                setVolumeNotification(null);
+            }, 3000);
         }
-        // Do not clear notification immediately if isSpeaking becomes false
-
+        
         // Cleanup function
         return () => {
             if (notificationTimeoutRef.current) {
                 clearTimeout(notificationTimeoutRef.current);
             }
         };
-    }, [speakerLevel, backgroundLevel]);
+    }, [speakerLevel]);
+
+    const AudioLevelIndicator = ({ level, label, color, baseline = null }: {
+        level: number,
+        label: string,
+        color: string,
+        baseline?: number | null
+    }) => (
+        <View style={styles.audioIndicator}>
+            <View style={styles.audioLabelContainer}>
+                <Text style={styles.audioLabel}>
+                    {label}: {level}dB
+                </Text>
+                {baseline !== null && (
+                    <Text style={styles.audioLabelSmall}>
+                        Baseline: {baseline}dB
+                    </Text>
+                )}
+            </View>
+            <View style={styles.audioBar}>
+                {baseline !== null && (
+                    <>
+                        <View style={[styles.baselineArea, { width: `${baseline}%` }]} />
+                        <View style={[styles.baselineMark, { left: `${baseline}%` }]} />
+                    </>
+                )}
+                <View
+                    style={[
+                        styles.audioLevel,
+                        {
+                            backgroundColor: color,
+                            marginLeft: baseline !== null ? `${baseline}%` : 0,
+                            width: baseline !== null ? `${Math.max(0, level - baseline)}%` : `${level}%`
+                        }
+                    ]}
+                />
+            </View>
+        </View>
+    );
+
+    const SoundLevelLegend = () => (
+        <View style={styles.legendContainer}>
+            <Text style={styles.legendTitle}>Sound Level Reference</Text>
+            <Text style={styles.legendDescription}>
+                Showing relative audio level in decibels (dB)
+            </Text>
+
+            <View style={styles.soundLevelBar}>
+                <View style={styles.soundLevelGradient}>
+                    <View style={[styles.soundLevelSegment, { backgroundColor: COLORS.AUDIO.QUIET }]} />
+                    <View style={[styles.soundLevelSegment, { backgroundColor: COLORS.AUDIO.MODERATE }]} />
+                    <View style={[styles.soundLevelSegment, { backgroundColor: COLORS.AUDIO.LOUD }]} />
+                </View>
+
+                <View style={styles.tickMarksContainer}>
+                    <View style={styles.tickMark} />
+                    <View style={styles.tickMark} />
+                    <View style={styles.tickMark} />
+                    <View style={styles.tickMark} />
+                </View>
+
+                <View style={styles.soundLevelLabels}>
+                    <Text style={styles.soundLevelLabel}>0dB</Text>
+                    <Text style={styles.soundLevelLabel}>{SOUND_LEVELS.MODERATE.MIN}dB</Text>
+                    <Text style={styles.soundLevelLabel}>{SOUND_LEVELS.LOUD.MIN}dB</Text>
+                    <Text style={styles.soundLevelLabel}>120dB</Text>
+                </View>
+            </View>
+
+            <View style={styles.legendItems}>
+                <View style={styles.legendItem}>
+                    <View style={[styles.legendColor, { backgroundColor: COLORS.AUDIO.QUIET }]} />
+                    <Text style={styles.legendText}>{SOUND_LEVELS.QUIET.LABEL} ({SOUND_LEVELS.QUIET.MIN}dB to {SOUND_LEVELS.QUIET.MAX}dB)</Text>
+                </View>
+                <View style={styles.legendItem}>
+                    <View style={[styles.legendColor, { backgroundColor: COLORS.AUDIO.MODERATE }]} />
+                    <Text style={styles.legendText}>{SOUND_LEVELS.MODERATE.LABEL} ({SOUND_LEVELS.MODERATE.MIN}dB to {SOUND_LEVELS.MODERATE.MAX}dB)</Text>
+                </View>
+                <View style={styles.legendItem}>
+                    <View style={[styles.legendColor, { backgroundColor: COLORS.AUDIO.LOUD }]} />
+                    <Text style={styles.legendText}>{SOUND_LEVELS.LOUD.LABEL} ({SOUND_LEVELS.LOUD.MIN}dB and above)</Text>
+                </View>
+            </View>
+        </View>
+    );
 
     const getVolumeColor = (speakerLevel: number): string => {
-        if (speakerLevel > 40) {
+        if (speakerLevel >= SOUND_LEVELS.LOUD.MIN) {
             return COLORS.AUDIO.LOUD;
-        } else if (speakerLevel > 25) {
+        } else if (speakerLevel >= SOUND_LEVELS.MODERATE.MIN) {
             return COLORS.AUDIO.MODERATE;
         }
         return COLORS.AUDIO.QUIET;
@@ -464,7 +622,7 @@ export const VoiceAnalytics: React.FC = () => {
         }).start();
     };
 
-    const getSpeakerDisplayName = (speakerId: string, userName: string): string => {
+    const getSpeakerDisplayName = (speakerId: string): string => {
         if (speakerId === 'Speaker Guest-1' && userName) {
             return `Speaker ${userName}`;
         }
@@ -491,26 +649,31 @@ export const VoiceAnalytics: React.FC = () => {
     };
 
     const downloadConversations = () => {
-        // Group all items by date (YYYY-MM-DD)
-        const itemsByDate = transcriptionHistory.reduce((acc, item) => {
-            const date = item.timestamp ? new Date(item.timestamp).toISOString().slice(0, 10) : 'unknown';
-            if (!acc[date]) {
-                acc[date] = [];
+        // Create text content from all conversations
+        const conversations = transcriptionHistory.reduce((acc, item) => {
+            if (!acc[item.conversationId]) {
+                acc[item.conversationId] = [];
             }
-            acc[date].push(item);
+            acc[item.conversationId].push(item);
             return acc;
-        }, {} as Record<string, typeof transcriptionHistory>);
+        }, {} as Record<string, Array<{
+            _id: string;
+            text: string;
+            timestamp: Date;
+            speakerId: string;
+            conversationId: string;
+        }>>);
 
-        const textContent = Object.entries(itemsByDate)
-            .map(([date, items]) => {
-                const dateStr = date !== 'unknown' ? new Date(date).toLocaleDateString() : '';
-                const dayText = items
+        const textContent = Object.entries(conversations)
+            .map(([conversationId, items]) => {
+                const date = new Date(items[0].timestamp).toLocaleDateString();
+                const conversationText = items
                     .map(item => {
-                        const time = item.timestamp ? new Date(item.timestamp).toLocaleTimeString() : '';
+                        const time = new Date(item.timestamp).toLocaleTimeString();
                         return `[${time}] Speaker ${item.speakerId}: ${item.text}`;
                     })
                     .join('\n');
-                return `Transcriptions from ${dateStr}\n${dayText}\n`;
+                return `Conversation from ${date}\n${conversationText}\n\n`;
             })
             .join('---\n\n');
 
@@ -526,179 +689,106 @@ export const VoiceAnalytics: React.FC = () => {
         URL.revokeObjectURL(url);
     };
 
-    // Helper to get background icon name based on volume
-    const getBackgroundIconName = (level: number): any => {
-        if (level >= 85) return 'airplanemode-active'; // Airplane
-        if (level >= 70) return 'directions-car';      // Car/Busy street
-        if (level >= 60) return 'vacuum';             // Vacuum cleaner
-        return 'background.volume';                    // Quiet/normal
+    // Add a button to open the Voice Profile Setup popup
+    const [isVoiceProfileSetupVisible, setIsVoiceProfileSetupVisible] = useState(false);
+
+    const openVoiceProfileSetup = () => {
+        setIsVoiceProfileSetupVisible(true);
     };
 
-    const cleanupAudioResources = () => {
-        if (sourceRef.current) {
-            sourceRef.current.disconnect();
-            sourceRef.current = null;
-        }
-        if (analyserRef.current) {
-            analyserRef.current = null;
-        }
-        if (audioContextRef.current) {
-            audioContextRef.current.close();
-            audioContextRef.current = null;
-        }
-    };
-
-    const cleanupTranscriber = () => {
-        if (cleanupRef.current) {
-            const transcriber = cleanupRef.current;
-            cleanupRef.current = null;
-            transcriber();
-        }
+    const closeVoiceProfileSetup = () => {
+        setIsVoiceProfileSetupVisible(false);
     };
 
     return (
         <View style={styles.container}>
-            {/* Header Bar */}
-            <View style={styles.headerBar}>
-                <TouchableOpacity
-                    style={styles.hamburgerButton}
-                    onPress={toggleSidebar}
-                    accessibilityLabel="Open sidebar menu"
-                >
-                    <Text style={styles.hamburgerIcon}>☰</Text>
-                </TouchableOpacity>
-                <Text style={styles.appTitle}>Voice Analytics</Text>
-                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
-                    <View style={styles.userAvatar} accessibilityLabel="User avatar">
-                        <Text style={styles.userAvatarText}>
-                            {user?.fullName ? user.fullName[0] : 'U'}
-                        </Text>
-                    </View>
-                    <TouchableOpacity
-                        style={styles.signOutButton}
-                        onPress={handleSignOut}
-                        accessibilityLabel="Sign out"
-                    >
-                        <Text style={styles.signOutText}>Sign Out</Text>
-                    </TouchableOpacity>
-                </View>
-            </View>
-
-            {/* Add sidebar */}
-            <Sidebar
-                isSidebarOpen={isSidebarOpen}
-                sidebarAnim={sidebarAnim}
-                transcriptionHistory={transcriptionHistory}
-                toggleSidebar={toggleSidebar}
-                downloadConversations={downloadConversations}
-            />
-
-            {/* Add overlay when sidebar is open */}
-            {isSidebarOpen && (
-                <TouchableOpacity
-                    style={styles.overlay}
-                    activeOpacity={1}
-                    onPress={toggleSidebar}
-                    accessibilityLabel="Close sidebar menu"
-                />
-            )}
-
-            {/* Name Input Modal */}
-            <Modal
-                transparent={true}
-                visible={nameModalVisible}
-                animationType="fade"
-                onRequestClose={() => setNameModalVisible(false)}
-            >
-                <View style={styles.modalOverlay}>
-                    <View style={styles.modalContent}>
-                        <TouchableOpacity
-                            style={styles.modalCloseButton}
-                            onPress={() => setNameModalVisible(false)}
-                            accessibilityLabel="Close name input modal"
-                        >
-                            <Text style={styles.modalCloseIcon}>×</Text>
-                        </TouchableOpacity>
-                        <Text style={styles.modalTitle}>Welcome to Voice Analytics</Text>
-                        <Text style={styles.modalDescription}>
-                            Please enter your name to personalize your experience
-                        </Text>
-                        <TextInput
-                            style={styles.nameInput}
-                            placeholder="Enter your name"
-                            value={tempName}
-                            onChangeText={setTempName}
-                            autoFocus
-                            accessibilityLabel="Name input"
-                        />
-                        <View style={styles.modalButtons}>
-                            <TouchableOpacity
-                                style={[styles.modalButton, styles.submitButton]}
-                                onPress={handleNameSubmit}
-                                accessibilityLabel="Continue with entered name"
-                            >
-                                <Text style={styles.submitButtonText}>Continue</Text>
-                            </TouchableOpacity>
-                        </View>
-                    </View>
-                </View>
-            </Modal>
-
-            {/* Snackbar Notification */}
-            {volumeNotification && (
-                <View style={styles.notificationContainer}>
-                    <MaterialIcons
-                        name={
-                            volumeNotification.type === 'high' ? 'volume-up' :
-                            volumeNotification.type === 'low' ? 'volume-down' :
-                            'volume-mute'
-                        }
-                        size={24}
-                        color={styles.notificationText.color}
-                        style={styles.notificationIcon}
-                    />
-                    <Text style={styles.notificationText}>
-                        {volumeNotification.message}
-                    </Text>
-                </View>
-            )}
-
             <ScrollView style={styles.scrollContainer} contentContainerStyle={styles.scrollContent}>
                 <View style={styles.mainContent}>
                     <View style={styles.leftColumn}>
-                        <View style={[styles.statusCard, { backgroundColor: getVolumeColor(backgroundLevel) }]}>
-                            {/* Live badge */}
-                            {currentSpeaker && (
-                                <View style={styles.liveBadge}>
-                                    <Text style={styles.liveText}>LIVE</Text>
-                                </View>
-                            )}
+                        <View style={[
+                            styles.statusCard,
+                            currentSpeaker === getSpeakerDisplayName('Speaker Guest-1') && {
+                                backgroundColor: getVolumeColor(speakerLevel)
+                            }
+                        ]}>
                             {error && (
                                 <View style={styles.errorContainer}>
                                     <Text style={styles.errorText}>{error}</Text>
                                 </View>
                             )}
+                            
+                            {/* Update userInfo styling to include hamburger button */}
                             {user && (
-                                <View style={styles.userInfo}>
-                                    <Text style={styles.welcomeText}>
-                                        Welcome, {user.fullName || user.firstName || 'User'}
-                                    </Text>
+                                <View style={[styles.userInfo, { width: '100%', paddingHorizontal: 8 }]}>
+                                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                                        <TouchableOpacity 
+                                            style={[styles.hamburgerButton, { 
+                                                position: 'relative', 
+                                                top: 0, 
+                                                left: 0, 
+                                                marginRight: 12,
+                                                marginBottom: 0
+                                            }]}
+                                            onPress={toggleSidebar}
+                                        >
+                                            <Text style={styles.hamburgerIcon}>☰</Text>
+                                        </TouchableOpacity>
+                                        <Text style={styles.welcomeText}>
+                                            Welcome, {user.fullName || user.firstName || 'User'}
+                                        </Text>
+                                    </View>
+                                    <TouchableOpacity
+                                        style={styles.signOutButton}
+                                        onPress={handleSignOut}
+                                    >
+                                        <Text style={styles.signOutText}>Sign Out</Text>
+                                    </TouchableOpacity>
                                 </View>
                             )}
+                            
+                            <Animated.View style={[
+                                styles.speakingIndicator,
+                                {
+                                    backgroundColor: currentSpeaker ?
+                                        (currentSpeaker === 'Speaker Guest-1' ? COLORS.SPEAKER.INACTIVE : COLORS.SPEAKER.INACTIVE) :
+                                        COLORS.SPEAKER.INACTIVE,
+                                    transform: [{ scale: currentSpeaker ? pulseAnim : 1 }]
+                                }
+                            ]}>
+                                {currentSpeaker && (
+                                    <View style={styles.speakingBadge}>
+                                        <Text style={styles.speakingBadgeText}>LIVE</Text>
+                                    </View>
+                                )}
+                            </Animated.View>
+
                             <Text style={styles.speakerStatus}>
                                 {currentSpeaker || 'No one speaking'}
                             </Text>
+
                             <TouchableOpacity
-                                style={styles.primaryButton}
+                                style={[
+                                    styles.button,
+                                    { backgroundColor: isListening ? COLORS.AUDIO.LOUD : COLORS.AUDIO.QUIET },
+                                    isInitializing && styles.buttonDisabled
+                                ]}
                                 onPress={() => isListening ? stopListening() : startListening()}
                                 disabled={isInitializing}
-                                accessibilityLabel={isListening ? 'Stop Recording' : 'Start Recording'}
                             >
-                                <Text style={styles.primaryButtonText}>
+                                <Text style={styles.buttonText}>
                                     {isInitializing ? 'Initializing...' : isListening ? 'Stop Recording' : 'Start Recording'}
                                 </Text>
                             </TouchableOpacity>
+
+                            {/* Add the button here */}
+                            <TouchableOpacity
+                                style={[styles.button, { backgroundColor: COLORS.UI.BORDER }]}
+                                onPress={openVoiceProfileSetup}
+                            >
+                                <Text style={styles.buttonText}>Open Voice Profile Setup</Text>
+                            </TouchableOpacity>
                         </View>
+
                         <View style={[styles.metricsContainer, isNarrowScreen ? styles.metricsContainerNarrow : {}]}>
                             <View style={[styles.metricsGrid, isNarrowScreen ? styles.metricsGridNarrow : {}]}>
                                 <View style={[styles.metricCard, isNarrowScreen ? styles.metricCardNarrow : {}]}>
@@ -710,6 +800,7 @@ export const VoiceAnalytics: React.FC = () => {
                                         baseline={backgroundLevel}
                                     />
                                 </View>
+
                                 <View style={[styles.metricCard, isNarrowScreen ? styles.metricCardNarrow : {}]}>
                                     <Text style={styles.metricLabel}>Background Level</Text>
                                     <AudioLevelIndicator
@@ -719,16 +810,20 @@ export const VoiceAnalytics: React.FC = () => {
                                     />
                                 </View>
                             </View>
+
                             <View style={[styles.legendWrapper, isNarrowScreen ? styles.legendWrapperNarrow : {}]}>
                                 <SoundLevelLegend />
                             </View>
                         </View>
+
                         <View style={styles.transcriptContainer}>
                             <Text style={styles.transcriptTitle}>Conversation History</Text>
-                            <TouchableOpacity onPress={toggleCollapse} style={styles.collapseHeader} accessibilityLabel="Toggle active speakers">
+
+                            <TouchableOpacity onPress={toggleCollapse} style={styles.collapseHeader}>
                                 <Text style={styles.collapseHeaderText}>Active Speakers</Text>
                                 <Text style={styles.collapseIcon}>{isCollapsed ? '▼' : '▲'}</Text>
                             </TouchableOpacity>
+
                             <Animated.View style={[
                                 styles.activeSpeakersContainer,
                                 {
@@ -746,31 +841,133 @@ export const VoiceAnalytics: React.FC = () => {
                                     </View>
                                 ))}
                             </Animated.View>
+
                             <View style={styles.transcriptsList}>
-                                {transcripts.map((transcript, index) => {
-                                    const isRight = transcript.speaker === getSpeakerDisplayName('Speaker Guest-1', userName);
-                                    return (
-                                        <View key={index} style={[styles.transcriptItem, isRight && { flexDirection: 'row-reverse' }]}> 
-                                            <View style={[
-                                                styles.transcriptBubble,
-                                                isRight && styles.transcriptBubbleRight
-                                            ]}>
-                                                <Text style={[
-                                                    styles.transcriptText,
-                                                    isRight && styles.transcriptTextRight
-                                                ]}>
-                                                    {transcript.text}
-                                                </Text>
-                                                <Text style={styles.timestamp}>{transcript.speaker}</Text>
-                                            </View>
-                                        </View>
-                                    );
-                                })}
+                                {transcripts.map((transcript, index) => (
+                                    <View key={index} style={styles.transcriptItem}>
+                                        <Text style={[
+                                            styles.transcriptSpeaker,
+                                            {
+                                                color: transcript.speaker === getSpeakerDisplayName('Speaker Guest-1') ?
+                                                    COLORS.SPEAKER.ACTIVE : COLORS.SPEAKER.OTHER
+                                            }
+                                        ]}>
+                                            {transcript.speaker}
+                                        </Text>
+                                        <Text style={styles.transcriptText}>{transcript.text}</Text>
+                                    </View>
+                                ))}
                             </View>
                         </View>
                     </View>
                 </View>
             </ScrollView>
+            
+            {/* Keep sidebar outside ScrollView but update its styles */}
+            <Animated.View 
+                style={[
+                    styles.sidebar,
+                    {
+                        transform: [{ translateX: sidebarAnim }],
+                        zIndex: 2000, // Ensure sidebar is above all content
+                    }
+                ]}
+            >
+                <View style={styles.sidebarHeader}>
+                    <View style={styles.sidebarTitleContainer}>
+                        <Text style={styles.sidebarTitle}>Conversation History</Text>
+                        <TouchableOpacity 
+                            style={styles.downloadButton}
+                            onPress={downloadConversations}
+                        >
+                            <Text style={styles.downloadButtonText}>⬇️</Text>
+                        </TouchableOpacity>
+                    </View>
+                    <TouchableOpacity 
+                        style={styles.closeButton}
+                        onPress={toggleSidebar}
+                    >
+                        <Text style={styles.closeButtonText}>×</Text>
+                    </TouchableOpacity>
+                </View>
+                <ScrollView style={styles.sidebarContent}>
+                    {Object.entries(
+                        transcriptionHistory.reduce((acc, item) => {
+                            if (!acc[item.conversationId]) {
+                                acc[item.conversationId] = [];
+                            }
+                            acc[item.conversationId].push(item);
+                            return acc;
+                        }, {} as Record<string, typeof transcriptionHistory>)
+                    ).map(([conversationId, items]) => (
+                        <View key={conversationId} style={styles.conversationGroup}>
+                            <Text style={styles.conversationDate}>
+                                {new Date(items[0].timestamp).toLocaleDateString()}
+                            </Text>
+                            {items.map((item, index) => (
+                                <View key={index} style={styles.historyItem}>
+                                    <View style={styles.historyItemHeader}>
+                                        <Text style={styles.historyTime}>
+                                            {new Date(item.timestamp).toLocaleTimeString()}
+                                        </Text>
+                                    </View>
+                                    <View style={styles.historyContent}>
+                                        <Text style={styles.historySpeaker}>
+                                            Speaker {item.speakerId}
+                                        </Text>
+                                        <Text style={styles.historyText}>{item.text}</Text>
+                                    </View>
+                                    {index < items.length - 1 && (
+                                        <View style={styles.historyDivider} />
+                                    )}
+                                </View>
+                            ))}
+                        </View>
+                    ))}
+                </ScrollView>
+            </Animated.View>
+
+            {/* Keep overlay outside ScrollView */}
+            {isSidebarOpen && (
+                <TouchableOpacity 
+                    style={[styles.overlay, { zIndex: 1500 }]} // Higher than content but lower than sidebar
+                    activeOpacity={1}
+                    onPress={toggleSidebar}
+                />
+            )}
+
+            {/* Keep volume notification outside ScrollView */}
+            {isListening && volumeNotification && (
+                <View style={[
+                    styles.notificationContainer,
+                    { 
+                        backgroundColor: volumeNotification.type === 'high' ? '#fee2e2' : '#e0f2fe',
+                        borderColor: volumeNotification.type === 'high' ? '#ef4444' : '#3b82f6',
+                        zIndex: 2500 // Ensure notification is above all
+                    }
+                ]}>
+                    <Text style={[
+                        styles.notificationText,
+                        { color: volumeNotification.type === 'high' ? '#991b1b' : '#1e40af' }
+                    ]}>
+                        {volumeNotification.message}
+                    </Text>
+                </View>
+            )}
+
+            {/* Add the VoiceProfileSetup component */}
+            {isVoiceProfileSetupVisible && (
+                <Modal
+                    visible={isVoiceProfileSetupVisible}
+                    animationType="slide"
+                    transparent={true}
+                >
+                    <VoiceProfileSetup
+                        isVisible={isVoiceProfileSetupVisible}
+                        onComplete={closeVoiceProfileSetup}
+                    />
+                </Modal>
+            )}
         </View>
     );
 };
