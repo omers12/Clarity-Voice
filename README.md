@@ -44,7 +44,10 @@ src/
 ├── recorder.js     – Microphone stream handler  
 └── whisper.js      – Integration with speech-to-text AI model
 
-#📬 Contact
+
+
+
+###📬 Contact
 Email: omershay1212@gmail.com
 
 Phone: +972-509-355-151
