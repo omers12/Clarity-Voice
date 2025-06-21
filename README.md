@@ -1,3 +1,6 @@
+Sure! Here's the updated README with the **Contact** section moved one tab back as requested:
+
+````markdown
 # Clarity‑Voice 🎙️  
 **Final Project – B.Sc. Software Engineering Degree**
 
@@ -36,20 +39,27 @@ git clone https://github.com/omers12/Clarity-Voice.git
 cd Clarity-Voice
 npm install        # or `pip install -r requirements.txt`
 npm start          # or `python main.py`
+````
 
-#🗂️ Project Structure 
+---
+
+## 🗂️ Project Structure
+
+```
 src/
 ├── index.html      – Front-end user interface  
 ├── app.js          – Main speech volume logic  
 ├── recorder.js     – Microphone stream handler  
 └── whisper.js      – Integration with speech-to-text AI model
+```
 
+---
 
+## 📬 Contact
 
-
-###📬 Contact
-Email: omershay1212@gmail.com
-
+Email: [omershay1212@gmail.com](mailto:omershay1212@gmail.com)
 Phone: +972-509-355-151
+GitHub: [https://github.com/omers12](https://github.com/omers12)
 
-GitHub: https://github.com/omers12
+
+
